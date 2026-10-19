@@ -1,0 +1,15 @@
+# PLANTILLA (no se ejecuta aquí): copiar a .github/workflows/ de cada repo SOLO si
+# el plan de GitHub no permite exigir el escaneo de vulnerabilidades con un ruleset de organización.
+# Cambiar ORG por el nombre de la organización.
+
+name: Escaneo de Vulnerabilidades
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  escaneo:
+    uses: ORG/security-pipelines/.github/workflows/escaneo-vulnerabilidades.yml@main
