@@ -1,0 +1,15 @@
+# ARCHIVO DE PRUEBA: workflow inseguro a propósito para validar zizmor.
+# Solo se ejecuta a mano (workflow_dispatch) y no hace nada útil; bórralo después de la prueba.
+name: Prueba zizmor (inseguro a proposito)
+
+on:
+  workflow_dispatch:
+
+permissions: write-all
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Workflow de prueba"
