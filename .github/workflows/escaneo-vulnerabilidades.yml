@@ -1,0 +1,202 @@
+# ESCANEO DE VULNERABILIDADES: revisa el código del PR sin ejecutar la aplicación.
+# Seis herramientas en paralelo, una por job:
+#
+#   SAST: Semgrep               fallas de seguridad en la lógica del código
+#   Secretos: Gitleaks          contraseñas, tokens y llaves por patrón
+#   Secretos activos: TruffleHog  solo los secretos que siguen FUNCIONANDO
+#   IaC: Checkov                malas configuraciones en Terraform/Docker/K8s
+#   Dependencias: Trivy         librerías con vulnerabilidades conocidas (CVE)
+#   Workflows: zizmor           fallas de seguridad en los propios GitHub Actions
+#
+# Modo evaluación vs. bloqueo: variable SECURITY_BLOCKING (de repo u organización).
+# Si no existe o no es "true", los hallazgos se reportan pero NO bloquean el merge.
+#
+# Todo va fijado: Actions por SHA, binarios con checksum, paquetes con versión exacta.
+
+name: Escaneo de Vulnerabilidades
+
+on:
+  pull_request:
+  merge_group:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  SEMGREP_VERSION: "1.178.0"
+  SEMGREP_RULES: "p/default p/kotlin p/java p/python"
+  CHECKOV_VERSION: "3.3.21"
+  ZIZMOR_VERSION: "1.30.1"
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRUFFLEHOG_VERSION: "3.97.9"
+  TRUFFLEHOG_SHA256: "40377e6572495412fb9ba0bc21c9401f73b72f1d2afd11b9931bc4a5ed622866"
+  TRIVY_VERSION: "0.75.0"
+  TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+  # Commit base y final del PR. Vacíos fuera de un PR (entonces se escanea todo).
+  BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+
+jobs:
+  semgrep:
+    name: "SAST: Semgrep"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Instalar Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+      - name: Escanear
+        run: |
+          ARGS=""
+          for r in $SEMGREP_RULES; do ARGS="$ARGS --config $r"; done
+          # En PRs, solo hallazgos NUEVOS respecto a la rama base.
+          if [ -n "$BASE_SHA" ]; then ARGS="$ARGS --baseline-commit $BASE_SHA"; fi
+          # shellcheck disable=SC2086
+          semgrep scan $ARGS --sarif-output=semgrep.sarif --error --metrics=off
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-semgrep
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+  gitleaks:
+    name: "Secretos: Gitleaks"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Instalar Gitleaks
+        run: |
+          F="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o "$F" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${F}"
+          echo "${GITLEAKS_SHA256}  ${F}" | sha256sum -c -
+          tar xzf "$F" gitleaks && sudo mv gitleaks /usr/local/bin/
+      - name: Escanear
+        run: |
+          OPTS="--all"
+          if [ -n "$BASE_SHA" ]; then OPTS="${BASE_SHA}..${HEAD_SHA}"; fi
+          gitleaks git --log-opts="$OPTS" --redact \
+            --report-format sarif --report-path gitleaks.sarif --exit-code 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  trufflehog:
+    name: "Secretos activos: TruffleHog"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Instalar TruffleHog
+        run: |
+          F="trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$F" "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/${F}"
+          echo "${TRUFFLEHOG_SHA256}  ${F}" | sha256sum -c -
+          tar xzf "$F" trufflehog && sudo mv trufflehog /usr/local/bin/
+      - name: Escanear (solo secretos verificados como activos)
+        run: |
+          RANGE=""
+          if [ -n "$BASE_SHA" ]; then RANGE="--since-commit $BASE_SHA --branch $HEAD_SHA"; fi
+          # shellcheck disable=SC2086
+          trufflehog git file://. $RANGE --results=verified --fail --no-update --json \
+            > trufflehog.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-trufflehog
+          path: trufflehog.json
+          if-no-files-found: ignore
+
+  checkov:
+    name: "IaC: Checkov"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Instalar Checkov
+        run: pipx install "checkov==${CHECKOV_VERSION}"
+      - name: Escanear
+        # Sin el análisis de GitHub Actions: de eso se encarga zizmor.
+        # Si el repo no tiene Terraform/CloudFormation/K8s/Dockerfile, termina sin hallazgos.
+        run: |
+          checkov -d . --quiet --compact --skip-framework github_actions \
+            -o cli -o sarif --output-file-path console,checkov-out
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-checkov
+          path: checkov-out/
+          if-no-files-found: ignore
+
+  trivy:
+    name: "Dependencias: Trivy"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Instalar Trivy
+        run: |
+          F="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL -o "$F" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${F}"
+          echo "${TRIVY_SHA256}  ${F}" | sha256sum -c -
+          tar xzf "$F" trivy && sudo mv trivy /usr/local/bin/
+      - name: Escanear (solo HIGH y CRITICAL)
+        run: |
+          trivy fs . --scanners vuln --severity HIGH,CRITICAL --format sarif --output trivy.sarif
+          trivy fs . --scanners vuln --severity HIGH,CRITICAL --format table --exit-code 1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-trivy
+          path: trivy.sarif
+          if-no-files-found: ignore
+
+  zizmor:
+    name: "Workflows: zizmor"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: ${{ vars.SECURITY_BLOCKING != 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Instalar zizmor
+        run: pipx install "zizmor==${ZIZMOR_VERSION}"
+      - name: Escanear
+        env:
+          # Token de solo lectura: habilita las revisiones que consultan GitHub
+          # (Actions con vulnerabilidades conocidas, commits impostores).
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zizmor . --format sarif > zizmor.sarif || true
+          zizmor . --min-severity medium
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: reporte-zizmor
+          path: zizmor.sarif
+          if-no-files-found: ignore
